@@ -1222,7 +1222,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/tonconnect-manifest.json', (req, res) => {
-  res.set(CORS).json({ url: 'https://t.me/RaseenRacingbot', name: 'RaseenRacing', iconUrl: 'https://i.supaimg.com/ec27537b-aa6a-42cf-8ba1-d6850eeea36d/9b1e5a6e-3d27-4f28-9d79-4ff5ec1cd0d3.png', description: 'Raseen Racing Garage' });
+  res.set(CORS).json({ url: 'https://t.me/RaseenRacingbot', name: 'RaseenRacing', iconUrl: 'https://res.cloudinary.com/dktppfipy/image/upload/v1778675636/bd57c63b-71a1-4114-8207-3763fbab038f_xxeo3c.jpg', description: 'Raseen Racing Garage' });
 });
 
 app.post('/api', async (req, res) => {
