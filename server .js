@@ -7,7 +7,7 @@
 //    BOT_TOKEN              Telegram Bot Token
 //    ADMIN_IDS              comma-separated admin Telegram IDs
 //    PORT                   (optional, default 3000)
-// ================================================================
+// ===============================================================
 
 import express from 'express';
 import { createHmac } from 'crypto';
