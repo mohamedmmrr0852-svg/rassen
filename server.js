@@ -1222,7 +1222,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/tonconnect-manifest.json', (req, res) => {
-  res.set(CORS).json({ url: 'https://raseenracing.vercel.app', name: 'Rassen Racing', iconUrl: 'https://res.cloudinary.com/dktppfipy/image/upload/v1778675636/bd57c63b-71a1-4114-8207-3763fbab038f_xxeo3c.jpg', description: 'Raseen Racing Garage' });
+  res.set(CORS).json({ url: 'https://raseenracing.vercel.app', name: 'Rassen Racing', iconUrl: 'https://res.cloudinary.com/dktppfipy/image/upload/v1779047569/icon_gwkepe.jpg', description: 'Raseen Racing Garage' });
 });
 
 app.post('/api', async (req, res) => {
