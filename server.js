@@ -285,7 +285,7 @@ const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,createTask:
 function userActionOk(uid,action){const cd=ACTION_COOLDOWNS[action];if(!cd)return true;const key=`${uid}:${action}`;const now=Date.now();const last=_userActionTs.get(key)||0;if(now-last<cd)return false;_userActionTs.set(key,now);return true;}
 
 // Logging
-const BALANCE_CHANGE_EVENTS=new Set(['withdraw_request','withdraw_approved','withdraw_rejected','deposit_completed','claim_task','verify_task','create_task','admin_set_balance','admin_confirm_deposit','referral_commission','buy_bike','upgrade_stats','bike_mining_start','bike_mining_claim','claim_mission_task','partner_post_reward','race_result','race_join','race_refund']);
+const BALANCE_CHANGE_EVENTS=new Set(['withdraw_request','deposit_completed','claim_task','verify_task','create_task','admin_set_balance','admin_confirm_deposit','referral_commission','buy_bike','upgrade_stats','bike_mining_start','bike_mining_claim','claim_mission_task','partner_post_reward','race_result']);
 function log(env,uid,type,details={},meta={}){
   if(!BALANCE_CHANGE_EVENTS.has(type))return;
   const ts=Date.now();const date=new Date(ts).toISOString();
@@ -441,7 +441,27 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
     const wr=await dbGet(env,`users/${uid}/wdHistory`);
     const wdHistory=wr.data?Object.values(wr.data).sort((a,b)=>b.ts-a.ts).slice(0,10):[];
     const lr=await dbGet(env,`users/${uid}/log`);
-    const balanceLog=lr.data?Object.values(lr.data).sort((a,b)=>b.ts-a.ts).slice(0,50).map(e=>({ts:e.ts,type:e.type,amount:e.amount,balance:e.balance,won:e.won,cost:e.cost,prize:e.prize,opponent:e.opponent,opponentName:e.opponentName,tonBalance_before:e.tonBalance_before,tonBalance_after:e.tonBalance_after,bikeLevel:e.bikeLevel,bikeName:e.bikeName,taskName:e.taskName,taskId:e.taskId,ton_reward:e.ton_reward,fee:e.fee,wdId:e.wdId,refunded:e.refunded,by:e.by})):[];
+    const balanceLog=lr.data?Object.values(lr.data).sort((a,b)=>b.ts-a.ts).slice(0,50).map(e=>({
+      ts:e.ts,date:e.date,type:e.type,
+      // balance fields
+      balance_before:e.tonBalance_before,balance_after:e.tonBalance_after,
+      // generic amount (try all possible field names)
+      amount:e.amount||e.ton_reward||e.price||e.cost_ton||e.comm||e.reward||e.amount_net||null,
+      // race specific
+      won:e.won,prize:e.prize,cost:e.cost,opponent:e.opponent,matchId:e.matchId,
+      // bike/mining
+      bikeLevel:e.bikeLevel,stat:e.stat,upgradeCount:e.upgradeCount,
+      completed:e.completed,ton_reward:e.ton_reward,
+      // task/mission
+      taskId:e.taskId,
+      // withdraw/deposit
+      wdId:e.wdId,amount_requested:e.amount_requested,fee:e.fee,amount_net:e.amount_net,address:e.address,
+      depositId:e.depositId,amount_ton:e.amount_ton,
+      // referral
+      from:e.from,bikePriceTon:e.bikePriceTon,
+      // admin
+      by:e.by,
+    })):[];
     // Fetch partner + community tasks to return to frontend
     const [tPartnerR,tCommunityR]=await Promise.all([
       dbGet(env,'tasks/partner'),
@@ -494,7 +514,7 @@ async function hBuyBike(env,uid,data,_meta={},ctx=null){
     const newOwned=[...owned,lv];
     const newTotal=(user.totalBikesBought||0)+1;
     await dbUpdate(env,`users/${uid}`,{tonBalance:newTon,ownedBikes:newOwned,totalBikesBought:newTotal});
-    log(env,uid,'buy_bike',{bikeLevel:lv,bikeName:BIKE_NAMES[lv]||('Bike '+lv),price:priceTon,tonBalance_before:user.tonBalance||0,tonBalance_after:newTon},_meta);
+    log(env,uid,'buy_bike',{bikeLevel:lv,price:priceTon,tonBalance_before:user.tonBalance||0,tonBalance_after:newTon},_meta);
     const _bkNames=BIKE_NAMES;
     const _bkDaily=BIKE_DAILY_TON[lv]||0;
     if(ctx&&ctx.waitUntil)ctx.waitUntil((async()=>{const _ul=await getUserLang(env,uid);await sendTgNotification(env,uid,m('bike_bought',_ul,_bkNames[lv]||'Level '+lv,lv,bike.speed,bike.nitro,bike.accel,bike.maneuver,_bkDaily,(_bkDaily*30).toFixed(4)));})().catch(()=>{}));
@@ -614,7 +634,7 @@ async function hStartBikeMining(env,uid,data,_meta={},ctx=null){
     mining[String(lv)]=rec;
     const newMiningRuns=(user.totalMiningRuns||0)+1;
     await dbUpdate(env,`users/${uid}`,{bikeMining:mining,totalMiningRuns:newMiningRuns});
-    log(env,uid,'bike_mining_start',{bikeLevel:lv,bikeName:BIKE_NAMES[lv]||('Bike '+lv),dailyReward:reward,startsAt:now,endsAt:rec.endsAt,totalMiningRuns:newMiningRuns,tonBalance:user.tonBalance||0},_meta);
+    log(env,uid,'bike_mining_start',{bikeLevel:lv,reward,startsAt:now,endsAt:rec.endsAt},_meta);
     return{success:true,data:{bikeMining:mining,started:rec,settledTon:settled.tonAdded||0,tonBalance:user.tonBalance||0,totalMiningRuns:newMiningRuns}};
   }catch(e){return{success:false,error:e.message};}
 }
@@ -667,9 +687,9 @@ async function hWithdraw(env,uid,data,_meta={}){
       if(missingPartner.length>0){await dbSet(env,lockKey,{ts:0});return{success:false,error:'Complete all partner tasks first',errorCode:'PARTNER_TASKS_REQUIRED',missing:missingPartner.length};}
       
       const wdId=`wd_${uid}_${now}`;
-      // Apply 10% withdrawal fee only for amounts > 0.01 TON
+      // Apply 10% withdrawal fee only for amounts above 0.01 TON
       const FREE_FEE_THRESHOLD=0.01;
-      const feeAmt=amt<=FREE_FEE_THRESHOLD?0:parseFloat((amt*G.WITHDRAW_FEE_PCT/100).toFixed(8));
+      const feeAmt=amt>FREE_FEE_THRESHOLD?parseFloat((amt*G.WITHDRAW_FEE_PCT/100).toFixed(8)):0;
       const netAmt=parseFloat((amt-feeAmt).toFixed(8));
       const upd={tonBalance:parseFloat(((user.tonBalance||0)-amt).toFixed(8)),_lastWdTs:now,hasWithdrawn:true,withdrawWallet:addr};
       await dbUpdate(env,`users/${uid}`,upd);
@@ -744,8 +764,8 @@ async function hClaimTask(env,uid,data,_meta={},ctx=null){
       }
       const newTon=(user.tonBalance||0)+tonReward;
       await dbUpdate(env,`users/${uid}`,{completedTasks:[...(user.completedTasks||[]),tid],tonBalance:parseFloat(newTon.toFixed(8))});
+      log(env,uid,'claim_task',{taskId:tid,ton_reward:tonReward,tonBalance_before:user.tonBalance||0,tonBalance_after:newTon},_meta);
       const _rtn={rt10:'10 Active Refs',rt50:'50 Active Refs',rt100:'100 Active Refs',rt200:'200 Active Refs',rt500:'500 Active Refs',rt1000:'1000 Active Refs'};
-      log(env,uid,'claim_task',{taskId:tid,taskName:_rtn[tid]||tid,ton_reward:tonReward,tonBalance_before:user.tonBalance||0,tonBalance_after:newTon},_meta);
       if(ctx&&ctx.waitUntil)ctx.waitUntil((async()=>{const _tl=await getUserLang(env,uid);await sendTgNotification(env,uid,m('task_done',_tl,_rtn[tid]||tid,tonReward));})().catch(()=>{}));
       await dbSet(env,lockKey,{ts:0});
       return{success:true,data:{tonBalance:parseFloat(newTon.toFixed(8)),tonAdded:tonReward}};
@@ -789,8 +809,8 @@ async function hClaimMissionTask(env,uid,data,_meta={},ctx=null){
         completedMissions:[...(user.completedMissions||[]),tid],
         tonBalance:parseFloat(newTon.toFixed(8))
       });
+      log(env,uid,'claim_mission_task',{taskId:tid,ton_reward:tonReward,tonBalance_before:user.tonBalance||0,tonBalance_after:newTon},_meta);
       const _mn={bt5:'Buy 5 Bikes',bt10:'Buy 10 Bikes',rc10:'10 Races',rc20:'20 Races',rc50:'50 Races',mt20:'20 Mining Runs',mt50:'50 Mining Runs'};
-      log(env,uid,'claim_mission_task',{taskId:tid,taskName:_mn[tid]||tid,ton_reward:tonReward,tonBalance_before:user.tonBalance||0,tonBalance_after:newTon},_meta);
       if(ctx&&ctx.waitUntil)ctx.waitUntil((async()=>{const _msl=await getUserLang(env,uid);await sendTgNotification(env,uid,m('mission_done',_msl,_mn[tid]||tid,tonReward));})().catch(()=>{}));
       await dbSet(env,lockKey,{ts:0});
       return{success:true,data:{tonBalance:parseFloat(newTon.toFixed(8)),tonAdded:tonReward}};
@@ -941,7 +961,6 @@ async function hRaceJoinQueue(env,uid,data,_meta={},ctx=null){
     // Charge entry fee
     const balAfter=parseFloat(((user.tonBalance||0)-RACE_COST).toFixed(4));
     await dbUpdate(env,`users/${uid}`,{tonBalance:balAfter});
-    log(env,uid,'race_join',{cost:RACE_COST,bikeLevel:lv,tonBalance_before:user.tonBalance||0,tonBalance_after:balAfter},_meta);
     const power=_bikePower(user,lv);
     const me={uid,lv,power:power.total,maxKmh:power.maxKmh,
       name:(user.firstName||'Player').slice(0,32),
@@ -1008,8 +1027,12 @@ async function hRaceJoinQueue(env,uid,data,_meta={},ctx=null){
         updates.push(dbUpdate(env,`users/${loserUid}`,{totalRacesPlayed:(lRef.data.totalRacesPlayed||0)+1}));
       }
       await Promise.all(updates);
-      log(env,uid,    'race_result',{won:winnerUid===uid,    cost:RACE_COST,prize:winnerUid===uid?    RACE_PRIZE:0,matchId,opponent:opp.uid,opponentName:opp.name,tonBalance_before:(wRef.data||lRef.data)&&winnerUid===uid?(wRef.data?.tonBalance||0)-RACE_PRIZE:(lRef.data?.tonBalance||0)+RACE_COST,tonBalance_after:winnerUid===uid?(wRef.data?.tonBalance||0):(lRef.data?.tonBalance||0)},_meta);
-      log(env,opp.uid,'race_result',{won:winnerUid===opp.uid,cost:RACE_COST,prize:winnerUid===opp.uid?RACE_PRIZE:0,matchId,opponent:uid,opponentName:me.name,tonBalance_before:winnerUid===opp.uid?(wRef.data?.tonBalance||0)-RACE_PRIZE:(lRef.data?.tonBalance||0)+RACE_COST,tonBalance_after:winnerUid===opp.uid?(wRef.data?.tonBalance||0):(lRef.data?.tonBalance||0)},_meta);
+      // Log with full balance context for audit trail
+      const winnerBalBefore=wRef.data?(wRef.data.tonBalance||0):0;
+      const loserBalBefore=lRef.data?(lRef.data.tonBalance||0):0;
+      const winnerBalAfter=winnerBalBefore+RACE_PRIZE;
+      log(env,uid,    'race_result',{won:winnerUid===uid,cost:RACE_COST,prize:winnerUid===uid?RACE_PRIZE:0,matchId,opponent:opp.uid,opponentName:opp.name,tonBalance_before:winnerUid===uid?winnerBalBefore:loserBalBefore,tonBalance_after:winnerUid===uid?parseFloat(winnerBalAfter.toFixed(4)):loserBalBefore},_meta);
+      log(env,opp.uid,'race_result',{won:winnerUid===opp.uid,cost:RACE_COST,prize:winnerUid===opp.uid?RACE_PRIZE:0,matchId,opponent:uid,opponentName:me.name,tonBalance_before:winnerUid===opp.uid?winnerBalBefore:loserBalBefore,tonBalance_after:winnerUid===opp.uid?parseFloat(winnerBalAfter.toFixed(4)):loserBalBefore},_meta);
       // Store notification intent in the match record — sent after race finishes via raceAck
       // This prevents the bot message from arriving before the race animation even starts
       await dbUpdate(env,`raceMatches/${matchId}`,{
@@ -1091,7 +1114,6 @@ async function hRaceCancelQueue(env,uid,_data,_meta={}){
     if(u.data){
       const newBal=parseFloat(((u.data.tonBalance||0)+RACE_COST).toFixed(4));
       await dbUpdate(env,`users/${uid}`,{tonBalance:newBal});
-      log(env,uid,'race_refund',{reason:'cancelled',refunded:RACE_COST,tonBalance_before:u.data.tonBalance||0,tonBalance_after:newBal},_meta);
       return{success:true,data:{refunded:true,tonBalance:newBal}};
     }
     return{success:true,data:{refunded:true}};
@@ -1171,22 +1193,17 @@ async function hAdmin(env,action,data,ctx=null){
       const r=await dbGet(env,`withdrawQueue/${data.wdId}`);if(!r.data)return{success:false,error:'Not found'};
       await dbUpdate(env,`withdrawQueue/${data.wdId}`,{status:'approved',updatedAt:Date.now()});
       await dbUpdate(env,`users/${r.data.userId}/wdHistory/${data.wdId}`,{status:'approved',updatedAt:Date.now()});
-      log(env,r.data.userId,'withdraw_approved',{wdId:data.wdId,amt:r.data.amt,by:'admin'});
       if(ctx&&ctx.waitUntil)ctx.waitUntil((async()=>{const _wdl=await getUserLang(env,r.data.userId);await sendTgNotification(env,r.data.userId,m('wd_approved',_wdl,r.data.amt));})().catch(()=>{}));
       return{success:true};
     }
     case 'adminRejectWithdraw':{
       const r=await dbGet(env,`withdrawQueue/${data.wdId}`);if(!r.data)return{success:false,error:'Not found'};
-      // Refund the full requested amount (amtRequested), not just netAmt
-      const refundAmt=r.data.amtRequested||r.data.amt||0;
       await dbUpdate(env,`withdrawQueue/${data.wdId}`,{status:'rejected',updatedAt:Date.now()});
+      await dbUpdate(env,`users/${r.data.userId}/wdHistory/${data.wdId}`,{status:'rejected',updatedAt:Date.now()});
+      // Refund the full amount that was deducted (amtRequested), not just the net amt
+      const refundAmt=r.data.amtRequested||r.data.amt||0;
       const u=await dbGet(env,`users/${r.data.userId}`);
-      const newBal=u.data?parseFloat(((u.data.tonBalance||0)+refundAmt).toFixed(8)):0;
-      if(u.data){
-        await dbUpdate(env,`users/${r.data.userId}`,{tonBalance:newBal});
-        await dbUpdate(env,`users/${r.data.userId}/wdHistory/${data.wdId}`,{status:'rejected',updatedAt:Date.now()});
-        log(env,r.data.userId,'withdraw_rejected',{wdId:data.wdId,refunded:refundAmt,tonBalance_before:u.data.tonBalance||0,tonBalance_after:newBal,by:'admin'});
-      }
+      if(u.data)await dbUpdate(env,`users/${r.data.userId}`,{tonBalance:parseFloat(((u.data.tonBalance||0)+refundAmt).toFixed(8))});
       if(ctx&&ctx.waitUntil)ctx.waitUntil((async()=>{const _rjl=await getUserLang(env,r.data.userId);await sendTgNotification(env,r.data.userId,m('wd_rejected',_rjl,refundAmt));})().catch(()=>{}));
       return{success:true};
     }
