@@ -99,8 +99,8 @@ const BIKE_NAMES = {
 
 // Default partner tasks
 const DEFAULT_PARTNER_TASKS = [
-  { id:'partner_payouts', name:'Join Payouts Channel', type:'channel', link:'https://t.me/RaseenRacing_chat', imageUrl:'https://res.cloudinary.com/dktppfipy/image/upload/v1778747937/payments_c5ifxk.jpg', bambooReward:100, targetUsers:null, status:'active', isDefault:true },
-  { id:'partner_news',    name:'Join News Channel',    type:'channel', link:'https://t.me/RaseenRacing',        imageUrl:'https://res.cloudinary.com/dktppfipy/image/upload/v1778747938/news_ek96ui.jpg',     bambooReward:100, targetUsers:null, status:'active', isDefault:true },
+  { id:'partner_payouts', name:'Join Payouts Channel', type:'channel', link:'https://t.me/RaseenRacing_chat', imageUrl:'https://res.cloudinary.com/dktppfipy/image/upload/v1778747937/payments_c5ifxk.jpg', raseenReward:100, targetUsers:null, status:'active', isDefault:true },
+  { id:'partner_news',    name:'Join News Channel',    type:'channel', link:'https://t.me/RaseenRacing',        imageUrl:'https://res.cloudinary.com/dktppfipy/image/upload/v1778747938/news_ek96ui.jpg',     raseenReward:100, targetUsers:null, status:'active', isDefault:true },
 ];
 
 async function seedPartnerTasks(env){
