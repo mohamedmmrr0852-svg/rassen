@@ -281,7 +281,7 @@ function rateOk(ip){const now=Date.now();const d=_rl.get(ip)||{c:0,r:now+60000};
 
 // Per-user per-action cooldown
 const _userActionTs=new Map();
-const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,createTask:5000,buyBike:2500,upgradeStats:2500,deposit:2500,startBikeMining:2500,claimBikeMining:2500,raceResult:4000,raceJoinQueue:1500,racePoll:400,raceCancelQueue:1500,raceAck:800,claimMissionTask:2500,submitPartnerPost:5000,saveSeasonAlloc:10000,saveLanguage:2000};
+const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,verifyForcedSubscription:3000,createTask:5000,buyBike:2500,upgradeStats:2500,deposit:2500,startBikeMining:2500,claimBikeMining:2500,raceResult:4000,raceJoinQueue:1500,racePoll:400,raceCancelQueue:1500,raceAck:800,claimMissionTask:2500,submitPartnerPost:5000,saveSeasonAlloc:10000,saveLanguage:2000};
 function userActionOk(uid,action){const cd=ACTION_COOLDOWNS[action];if(!cd)return true;const key=`${uid}:${action}`;const now=Date.now();const last=_userActionTs.get(key)||0;if(now-last<cd)return false;_userActionTs.set(key,now);return true;}
 
 // Logging
@@ -355,9 +355,11 @@ function makeUser(uid,tg={},ref=null){
     lastName:(tg.last_name||'').slice(0,64),
     username:(tg.username||'').slice(0,64),
     photoUrl:(tg.photo_url||'').slice(0,512),
-    tonBalance:0,
+    tonBalance:0.01, // Free signup bonus
+    signupBonusGiven:true,
     hasDeposited:false,
     hasWithdrawn:false,
+    hasJoinedChannels:false, // Set true after forced subscription verified
     ownedBikes:[],
     bikeUpgrades:{},
     bikeMining:{},
@@ -420,10 +422,16 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
     user=settled.user;
     const rr=await dbGet(env,`users/${uid}/referrals`);
     const refList=Object.values(rr.data||{});
-    // Active referral = one who has made a withdrawal
+    // Active referral = one who has completed forced channel subscription (or deposited/withdrawn legacy)
     const referrals=await Promise.all(refList.map(async r=>{
       let hasWithdrawn=r.hasWithdrawn||false;
       let hasDeposited=r.hasDeposited||false;
+      let hasJoinedChannels=r.hasJoinedChannels||false;
+      if(!hasJoinedChannels){
+        const jr=await dbGet(env,`users/${r.userId}/hasJoinedChannels`);
+        hasJoinedChannels=jr.data===true;
+        if(hasJoinedChannels)await dbUpdate(env,`users/${uid}/referrals/${r.userId}`,{hasJoinedChannels:true}).catch(()=>{});
+      }
       if(!hasWithdrawn){
         const ud=await dbGet(env,`users/${r.userId}/hasWithdrawn`);
         hasWithdrawn=ud.data===true;
@@ -434,9 +442,9 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
         hasDeposited=ud.data===true;
         if(hasDeposited)await dbUpdate(env,`users/${uid}/referrals/${r.userId}`,{hasDeposited:true}).catch(()=>{});
       }
-      // Active = deposited OR withdrawn
-      const isActive = hasWithdrawn || hasDeposited;
-      return{userId:r.userId,name:`${r.firstName||''} ${r.lastName||''}`.trim()||'Friend',photo:r.photoUrl||null,date:r.joinedAt?new Date(r.joinedAt).toLocaleDateString():'',earned:r.earned||0,hasWithdrawn:isActive,hasDeposited:isActive};
+      // Active = joined forced channels (new rule) OR legacy deposited/withdrawn
+      const isActive = hasJoinedChannels || hasWithdrawn || hasDeposited;
+      return{userId:r.userId,name:`${r.firstName||''} ${r.lastName||''}`.trim()||'Friend',photo:r.photoUrl||null,date:r.joinedAt?new Date(r.joinedAt).toLocaleDateString():'',earned:r.earned||0,hasWithdrawn:isActive,hasDeposited:isActive,hasJoinedChannels:isActive};
     }));
     const wr=await dbGet(env,`users/${uid}/wdHistory`);
     const wdHistory=wr.data?Object.values(wr.data).sort((a,b)=>b.ts-a.ts).slice(0,10):[];
@@ -462,7 +470,7 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
       // admin
       by:e.by,
     })):[];
-    // Fetch partner + community tasks to return to frontend
+    // Fetch partner (forced channels) + community tasks
     const [tPartnerR,tCommunityR]=await Promise.all([
       dbGet(env,'tasks/partner'),
       dbGet(env,'tasks/community'),
@@ -474,6 +482,7 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
         tonBalance:user.tonBalance||0,
         hasDeposited:user.hasDeposited||false,
         hasWithdrawn:user.hasWithdrawn||false,
+        hasJoinedChannels:user.hasJoinedChannels||false,
         ownedBikes:user.ownedBikes||[],
         bikeUpgrades:user.bikeUpgrades||{},
         bikeMining:user.bikeMining||{},
@@ -493,7 +502,10 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
       completedMissions:user.completedMissions||[],
       wdHistory,
       balanceLog,
-      tasks:{partner:partnerTasksList,community:communityTasksList},
+      // Forced subscription channels (shown in modal, NOT in tasks page)
+      forcedChannels:partnerTasksList,
+      // Tasks page: only community tasks, partner removed
+      tasks:{partner:[],community:communityTasksList},
     }};
   }catch(e){console.error('getState',e);return{success:false,error:e.message,errorCode:'GET_STATE_ERROR'};}
 }
@@ -680,11 +692,9 @@ async function hWithdraw(env,uid,data,_meta={}){
       const hasPendingWd=Object.values(wdHistMap).some(w=>w&&w.status==='pending');
       if(hasPendingWd){await dbSet(env,lockKey,{ts:0});return{success:false,error:'You already have a pending withdrawal. Please wait for it to be processed before creating a new one.',errorCode:'PENDING_WITHDRAW_EXISTS'};}
       
-      const tpr=await dbGet(env,'tasks/partner');
-      const partnerTasks=tpr.data?Object.values(tpr.data).filter(t=>t.status==='active'):[];
-      const completedTasks=user.completedTasks||[];
-      const missingPartner=partnerTasks.filter(t=>!completedTasks.includes(t.id));
-      if(missingPartner.length>0){await dbSet(env,lockKey,{ts:0});return{success:false,error:'Complete all partner tasks first',errorCode:'PARTNER_TASKS_REQUIRED',missing:missingPartner.length};}
+      // Partner-tasks requirement removed — forced channel subscription handles this at startup.
+
+
       
       const wdId=`wd_${uid}_${now}`;
       // Apply 10% withdrawal fee only for amounts above 0.01 TON
@@ -752,9 +762,10 @@ async function hClaimTask(env,uid,data,_meta={},ctx=null){
         for(const refId of refIds){
           const hw=await dbGet(env,`users/${refId}/hasWithdrawn`);
           const hd=await dbGet(env,`users/${refId}/hasDeposited`);
-          if(hw.data===true||hd.data===true)activeCount++;
+          const hj=await dbGet(env,`users/${refId}/hasJoinedChannels`);
+          if(hw.data===true||hd.data===true||hj.data===true)activeCount++;
         }
-        if(activeCount<t.n){await dbSet(env,lockKey,{ts:0});return{success:false,error:`Need ${t.n} active referrals (who have withdrawn)`};}
+        if(activeCount<t.n){await dbSet(env,lockKey,{ts:0});return{success:false,error:`Need ${t.n} active referrals (who joined the required channels)`};}
         tonReward=t.ton;
       }else{
         // Unknown task - still mark completed (e.g. social tasks)
@@ -829,6 +840,38 @@ async function hSubmitPartnerPost(env,uid,data,_meta={}){
     await dbSet(env,`partnerPostQueue/${postId}`,rec);
     return{success:true,data:{postId,status:'pending'}};
   }catch(e){return{success:false,error:e.message};}
+}
+
+// ── Verify Forced Subscription (mandatory channels) ───────────────
+// Checks membership of both default partner channels. On first success:
+//  - sets users/{uid}/hasJoinedChannels = true
+//  - marks referrer's referral entry as active (hasJoinedChannels=true)
+async function hVerifyForcedSubscription(env,uid,_data,_meta={}){
+  try{
+    const ur=await dbGet(env,`users/${uid}`);
+    const user=ur.data;
+    if(!user)return{success:false,error:'User not found'};
+    if(user.hasJoinedChannels===true){
+      return{success:true,data:{joined:true,alreadyVerified:true,channels:DEFAULT_PARTNER_TASKS.map(t=>({id:t.id,link:t.link,name:t.name,joined:true}))}};
+    }
+    const results=[];
+    let allJoined=true;
+    for(const t of DEFAULT_PARTNER_TASKS){
+      const isMember=await checkMembership(env,uid,t.link);
+      results.push({id:t.id,link:t.link,name:t.name,joined:!!isMember});
+      if(!isMember)allJoined=false;
+    }
+    if(!allJoined){
+      return{success:false,error:'NOT_JOINED_ALL',errorCode:'NOT_JOINED_ALL',data:{joined:false,channels:results}};
+    }
+    await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:true});
+    // Mark referrer's referral entry as active
+    if(user.referredBy){
+      await dbUpdate(env,`users/${user.referredBy}/referrals/${uid}`,{hasJoinedChannels:true}).catch(()=>{});
+    }
+    log(env,uid,'forced_subscription_verified',{channels:results.map(r=>r.id)},_meta);
+    return{success:true,data:{joined:true,channels:results}};
+  }catch(e){console.error('verifyForcedSubscription:',e);return{success:false,error:e.message};}
 }
 
 // ── Check Membership ──────────────────────────────────────────────
@@ -1301,6 +1344,7 @@ app.post('/api', async (req, res) => {
     case 'deposit':           result = await hDeposit(env,uid,data,_meta); break;
     case 'claimTask':         result = await hClaimTask(env,uid,data,_meta,ctx); break;
     case 'verifyTask':        result = await hVerifyTask(env,uid,data,_meta); break;
+    case 'verifyForcedSubscription': result = await hVerifyForcedSubscription(env,uid,data,_meta); break;
     case 'createTask':        result = await hCreateTask(env,uid,data,_meta); break;
     case 'buyBike':           result = await hBuyBike(env,uid,data,_meta,ctx); break;
     case 'upgradeStats':      result = await hUpgradeStats(env,uid,data,_meta,ctx); break;
