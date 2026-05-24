@@ -1202,6 +1202,64 @@ async function hRacePoll(env,uid,_data,_meta={}){
     const q=await dbGet(env,`raceQueue/${uid}`);
     if(q.data){
       const waitedMs=Date.now()-(q.data.joinedAt||0);
+      // ── BOT MATCH: after 15 seconds with no real opponent ─────────
+      const BOT_MATCH_TIMEOUT=15000;
+      if(waitedMs>=BOT_MATCH_TIMEOUT && waitedMs<RACE_MATCH_TTL){
+        const BOT_NAMES=['SpeedDemon','NitroKing','TurboRider','GhostRacer','IronBike','ThunderBolt','RoadWarrior','NightRider','BlazingAxle','PistonKing','DriftMaster','QuantumRider'];
+        const BOT_PHOTOS=[
+          'https://res.cloudinary.com/dktppfipy/image/upload/v1778463425/848f5854-f2cc-4218-b073-1a8a4a12b4a7_e1ub3t.jpg',
+          'https://res.cloudinary.com/dktppfipy/image/upload/v1778862358/card_mz6jsx.jpg',
+          'https://res.cloudinary.com/dktppfipy/image/upload/v1778463497/toncoin-ton-logo_vpeeux.png',
+        ];
+        const botName=BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)];
+        const botPhoto=BOT_PHOTOS[Math.floor(Math.random()*BOT_PHOTOS.length)];
+        const botUid=`bot_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+        const botLv=q.data.lv;
+        const botBase=BIKE_BASE_STATS[botLv]||BIKE_BASE_STATS[1];
+        const botPowerTotal=botBase.speed+botBase.nitro+botBase.accel+botBase.maneuver;
+        const botMaxKmh=Math.min(500,Math.max(35,Math.round(botPowerTotal/2)));
+        const myPower=q.data.power||0;
+        // Winner decided by relative power + randomness
+        const rnd=Math.random();
+        let winnerUid;
+        if(myPower>botPowerTotal*1.15){winnerUid=rnd<0.72?uid:botUid;}
+        else if(botPowerTotal>myPower*1.15){winnerUid=rnd<0.72?botUid:uid;}
+        else{winnerUid=rnd<0.5?uid:botUid;}
+        await dbDelete(env,`raceQueue/${uid}`);
+        const matchId=`m_${Date.now()}_bot_${Math.random().toString(36).slice(2,9)}`;
+        const match={
+          matchId,createdAt:Date.now(),
+          winnerUid,prize:RACE_PRIZE,cost:RACE_COST,
+          isBot:true,botUid,
+          p1:{uid:uid,lv:q.data.lv,name:q.data.name,username:q.data.username||'',photoUrl:q.data.photoUrl||'',maxKmh:q.data.maxKmh,power:q.data.power},
+          p2:{uid:botUid,lv:botLv,name:botName,username:'',photoUrl:botPhoto,maxKmh:botMaxKmh,power:botPowerTotal,isBot:true},
+          ack:{}
+        };
+        await dbSet(env,`raceMatches/${matchId}`,match);
+        await dbSet(env,`userActiveMatch/${uid}`,matchId);
+        const u2=await dbGet(env,`users/${uid}`);
+        let curBal=0;
+        if(u2.data){
+          const upd={totalRacesPlayed:(u2.data.totalRacesPlayed||0)+1};
+          if(winnerUid===uid){
+            upd.tonBalance=parseFloat(((u2.data.tonBalance||0)+RACE_PRIZE).toFixed(4));
+            curBal=upd.tonBalance;
+          }else{
+            curBal=u2.data.tonBalance||0;
+          }
+          await dbUpdate(env,`users/${uid}`,upd);
+          log(env,uid,'race_result',{won:winnerUid===uid,cost:RACE_COST,prize:winnerUid===uid?RACE_PRIZE:0,matchId,opponent:botUid,opponentName:botName,isBot:true,tonBalance_before:u2.data.tonBalance||0,tonBalance_after:curBal},_meta);
+        }
+        return{success:true,data:{
+          status:'matched',matchId,
+          youWon:winnerUid===uid,
+          youAreP1:true,prize:RACE_PRIZE,
+          you:{uid:uid,lv:q.data.lv,name:q.data.name,username:q.data.username,photoUrl:q.data.photoUrl,maxKmh:q.data.maxKmh},
+          opp:{uid:botUid,lv:botLv,name:botName,username:'',photoUrl:botPhoto,maxKmh:botMaxKmh,isBot:true},
+          tonBalance:curBal
+        }};
+      }
+      // ── End bot match logic ───────────────────────────────────────
       if(waitedMs>RACE_MATCH_TTL){
         await dbDelete(env,`raceQueue/${uid}`);
         const u=await dbGet(env,`users/${uid}`);
@@ -1212,7 +1270,7 @@ async function hRacePoll(env,uid,_data,_meta={}){
         }
         return{success:true,data:{status:'idle',refunded:true}};
       }
-      return{success:true,data:{status:'waiting'}};
+      return{success:true,data:{status:'waiting',waitedMs}};
     }
     return{success:true,data:{status:'idle'}};
   }catch(e){console.error('racePoll:',e);return{success:false,error:e.message};}
@@ -1248,6 +1306,11 @@ async function hRaceAck(env,uid,_data,_meta={},ctx=null){
     const mr=await dbGet(env,`raceMatches/${matchId}`);
     if(mr.data){
       const mch=mr.data;
+      // ── Bot match: no second player to notify, clean up immediately ──
+      if(mch.isBot){
+        await dbDelete(env,`raceMatches/${matchId}`).catch(()=>{});
+        return{success:true,data:{cleared:true}};
+      }
       const otherUid = mch.p1.uid===uid ? mch.p2.uid : mch.p1.uid;
       // Send Telegram notifications on FIRST ack (race animation has now finished)
       const notif=mch.notifPending;
