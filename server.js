@@ -851,9 +851,9 @@ async function hVerifyForcedSubscription(env,uid,_data,_meta={}){
     const ur=await dbGet(env,`users/${uid}`);
     const user=ur.data;
     if(!user)return{success:false,error:'User not found'};
-    if(user.hasJoinedChannels===true){
-      return{success:true,data:{joined:true,alreadyVerified:true,channels:DEFAULT_PARTNER_TASKS.map(t=>({id:t.id,link:t.link,name:t.name,joined:true}))}};
-    }
+    // ALWAYS re-check membership on each call — no caching.
+    // This ensures users who left a channel after a previous verification
+    // get re-prompted on every app open.
     const results=[];
     let allJoined=true;
     for(const t of DEFAULT_PARTNER_TASKS){
@@ -862,16 +862,79 @@ async function hVerifyForcedSubscription(env,uid,_data,_meta={}){
       if(!isMember)allJoined=false;
     }
     if(!allJoined){
+      // If the user was previously marked as joined but is no longer a member
+      // of all channels, clear the flag so the next successful verification
+      // re-runs the referrer-activation logic.
+      if(user.hasJoinedChannels===true){
+        await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:false}).catch(()=>{});
+      }
       return{success:false,error:'NOT_JOINED_ALL',errorCode:'NOT_JOINED_ALL',data:{joined:false,channels:results}};
     }
-    await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:true});
-    // Mark referrer's referral entry as active
-    if(user.referredBy){
-      await dbUpdate(env,`users/${user.referredBy}/referrals/${uid}`,{hasJoinedChannels:true}).catch(()=>{});
+    // All joined — set the flag (and trigger referrer activation) only on first success.
+    if(user.hasJoinedChannels!==true){
+      await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:true});
+      if(user.referredBy){
+        await dbUpdate(env,`users/${user.referredBy}/referrals/${uid}`,{hasJoinedChannels:true}).catch(()=>{});
+      }
+      log(env,uid,'forced_subscription_verified',{channels:results.map(r=>r.id)},_meta);
     }
-    log(env,uid,'forced_subscription_verified',{channels:results.map(r=>r.id)},_meta);
     return{success:true,data:{joined:true,channels:results}};
   }catch(e){console.error('verifyForcedSubscription:',e);return{success:false,error:e.message};}
+}
+
+// ── Contests: Top Referrers (deposited) & Top Bike Owners ─────────
+// Prize pool: 150 TON per contest, distributed to top 10.
+const CONTEST_PRIZES = [45,28,20,15,12,10,8,6,4,2]; // sum = 150 TON
+async function hGetContests(env,uid,_data,_meta={}){
+  try{
+    const all=await dbGet(env,'users');
+    const users=all.data||{};
+    const refList=[];
+    const bikeList=[];
+    for(const [id,u] of Object.entries(users)){
+      if(!u||typeof u!=='object')continue;
+      // Referrals contest: count referrals where hasDeposited === true
+      let refCount=0;
+      const refs=u.referrals||{};
+      for(const r of Object.values(refs)){
+        if(r&&r.hasDeposited===true)refCount++;
+      }
+      // Bikes contest: count of paid bikes owned (exclude free starter bike id=0)
+      const bikeCount=Array.isArray(u.ownedBikes)
+        ? u.ownedBikes.filter(b=>Number(b)!==0).length
+        : 0;
+      const name=`${u.firstName||''} ${u.lastName||''}`.trim()||u.username||'Racer';
+      const photo=u.photoUrl||null;
+      if(refCount>0)refList.push({userId:id,name,photo,count:refCount});
+      if(bikeCount>0)bikeList.push({userId:id,name,photo,count:bikeCount});
+    }
+    refList.sort((a,b)=>b.count-a.count||a.userId.localeCompare(b.userId));
+    bikeList.sort((a,b)=>b.count-a.count||a.userId.localeCompare(b.userId));
+    const top=(arr)=>arr.slice(0,10).map((u,i)=>({
+      ...u,rank:i+1,prize:CONTEST_PRIZES[i]||0
+    }));
+    const myRank=(arr)=>{
+      const i=arr.findIndex(x=>x.userId===uid);
+      return i<0?null:{rank:i+1,count:arr[i].count,prize:CONTEST_PRIZES[i]||0};
+    };
+    return{success:true,data:{
+      referrals:{
+        title:'Top Referrers',
+        totalPrize:150,
+        top10:top(refList),
+        me:myRank(refList),
+        totalPlayers:refList.length,
+      },
+      bikes:{
+        title:'Top Bike Owners',
+        totalPrize:150,
+        top10:top(bikeList),
+        me:myRank(bikeList),
+        totalPlayers:bikeList.length,
+      },
+      prizes:CONTEST_PRIZES,
+    }};
+  }catch(e){console.error('getContests:',e);return{success:false,error:e.message};}
 }
 
 // ── Check Membership ──────────────────────────────────────────────
@@ -1358,6 +1421,7 @@ app.post('/api', async (req, res) => {
     case 'claimMissionTask':  result = await hClaimMissionTask(env,uid,data,_meta,ctx); break;
     case 'submitPartnerPost': result = await hSubmitPartnerPost(env,uid,data,_meta); break;
     case 'saveSeasonAlloc':   result = await hSaveSeasonAlloc(env,uid,data,_meta); break;
+    case 'getContests':       result = await hGetContests(env,uid,data,_meta); break;
     default: return res.status(400).json({ success: false, error: 'Unknown action' });
   }
   res.json(result);
