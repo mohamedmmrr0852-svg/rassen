@@ -20,6 +20,9 @@ const env = new Proxy({}, { get: (_, k) => process.env[k] });
 // ctx shim — waitUntil runs in background without blocking response
 const ctx = { waitUntil: (p) => { Promise.resolve(p).catch(e => console.error('bg task error:', e?.message)); } };
 
+function getBotToken(){
+  return process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN || process.env.TELEGRAM_TOKEN || '';
+}
 
 const G = {
   MIN_WITHDRAW_TON: 0.0001,
@@ -238,7 +241,7 @@ async function sendTgNotification(env,userId,message){
   try{
     if(!process.env.BOT_TOKEN){console.warn('sendTgNotification: BOT_TOKEN not set');return;}
     if(!userId){console.warn('sendTgNotification: userId is empty');return;}
-    const p=fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`,{
+    const p=fetch(`https://api.telegram.org/bot${botToken}/sendMessage`,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({chat_id:String(userId),text:message,parse_mode:'HTML',...PLAY_BUTTON}),
@@ -281,7 +284,7 @@ function rateOk(ip){const now=Date.now();const d=_rl.get(ip)||{c:0,r:now+60000};
 
 // Per-user per-action cooldown
 const _userActionTs=new Map();
-const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,verifyForcedSubscription:3000,createTask:5000,buyBike:2500,upgradeStats:2500,deposit:2500,startBikeMining:2500,claimBikeMining:2500,raceResult:4000,raceJoinQueue:1500,racePoll:400,raceCancelQueue:1500,raceAck:800,claimMissionTask:2500,submitPartnerPost:5000,saveSeasonAlloc:10000,saveLanguage:2000,getLeaderboard:8000};
+const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,verifyForcedSubscription:3000,createTask:5000,buyBike:2500,upgradeStats:2500,deposit:2500,startBikeMining:2500,claimBikeMining:2500,raceResult:4000,raceJoinQueue:1500,racePoll:400,raceCancelQueue:1500,raceAck:800,claimMissionTask:2500,submitPartnerPost:5000,saveSeasonAlloc:10000,saveLanguage:2000};
 function userActionOk(uid,action){const cd=ACTION_COOLDOWNS[action];if(!cd)return true;const key=`${uid}:${action}`;const now=Date.now();const last=_userActionTs.get(key)||0;if(now-last<cd)return false;_userActionTs.set(key,now);return true;}
 
 // Logging
@@ -470,15 +473,19 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
       // admin
       by:e.by,
     })):[];
-    // Fetch partner (forced channels) + community tasks
-    const [tPartnerR,tCommunityR]=await Promise.all([
+    // Fetch partner (forced channels) + community tasks + contests (preloaded with state)
+    const [tPartnerR,tCommunityR,contestsR]=await Promise.all([
       dbGet(env,'tasks/partner'),
       dbGet(env,'tasks/community'),
+      hGetContests(env,uid,{},_meta).catch(e=>({success:false,error:String(e&&e.message||e)})),
     ]);
-    const partnerTasksList=tPartnerR.data?Object.values(tPartnerR.data).filter(t=>t.status==='active'):[];
+    let partnerTasksList=tPartnerR.data?Object.values(tPartnerR.data).filter(t=>t.status==='active'):[];
+    if(!partnerTasksList.length) partnerTasksList=DEFAULT_PARTNER_TASKS.filter(t=>t.status==='active');
     const communityTasksList=tCommunityR.data?Object.values(tCommunityR.data).filter(t=>t.status==='active'):[];
+    const contestsData=(contestsR&&contestsR.success&&contestsR.data)?contestsR.data:null;
     return{success:true,data:{
       user:{
+        userId:uid,
         tonBalance:user.tonBalance||0,
         hasDeposited:user.hasDeposited||false,
         hasWithdrawn:user.hasWithdrawn||false,
@@ -506,6 +513,8 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
       forcedChannels:partnerTasksList,
       // Tasks page: only community tasks, partner removed
       tasks:{partner:[],community:communityTasksList},
+      // Contests data preloaded so leaderboard renders instantly
+      contests:contestsData,
     }};
   }catch(e){console.error('getState',e);return{success:false,error:e.message,errorCode:'GET_STATE_ERROR'};}
 }
@@ -851,9 +860,9 @@ async function hVerifyForcedSubscription(env,uid,_data,_meta={}){
     const ur=await dbGet(env,`users/${uid}`);
     const user=ur.data;
     if(!user)return{success:false,error:'User not found'};
-    if(user.hasJoinedChannels===true){
-      return{success:true,data:{joined:true,alreadyVerified:true,channels:DEFAULT_PARTNER_TASKS.map(t=>({id:t.id,link:t.link,name:t.name,joined:true}))}};
-    }
+    // ALWAYS re-check membership on each call — no caching.
+    // This ensures users who left a channel after a previous verification
+    // get re-prompted on every app open.
     const results=[];
     let allJoined=true;
     for(const t of DEFAULT_PARTNER_TASKS){
@@ -862,26 +871,90 @@ async function hVerifyForcedSubscription(env,uid,_data,_meta={}){
       if(!isMember)allJoined=false;
     }
     if(!allJoined){
+      // If the user was previously marked as joined but is no longer a member
+      // of all channels, clear the flag so the next successful verification
+      // re-runs the referrer-activation logic.
+      if(user.hasJoinedChannels===true){
+        await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:false}).catch(()=>{});
+      }
       return{success:false,error:'NOT_JOINED_ALL',errorCode:'NOT_JOINED_ALL',data:{joined:false,channels:results}};
     }
-    await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:true});
-    // Mark referrer's referral entry as active
-    if(user.referredBy){
-      await dbUpdate(env,`users/${user.referredBy}/referrals/${uid}`,{hasJoinedChannels:true}).catch(()=>{});
+    // All joined — set the flag (and trigger referrer activation) only on first success.
+    if(user.hasJoinedChannels!==true){
+      await dbUpdate(env,`users/${uid}`,{hasJoinedChannels:true});
+      if(user.referredBy){
+        await dbUpdate(env,`users/${user.referredBy}/referrals/${uid}`,{hasJoinedChannels:true}).catch(()=>{});
+      }
+      log(env,uid,'forced_subscription_verified',{channels:results.map(r=>r.id)},_meta);
     }
-    log(env,uid,'forced_subscription_verified',{channels:results.map(r=>r.id)},_meta);
     return{success:true,data:{joined:true,channels:results}};
   }catch(e){console.error('verifyForcedSubscription:',e);return{success:false,error:e.message};}
+}
+
+// ── Contests: Top Referrers (deposited) & Top Bike Owners ─────────
+// Prize pool: 150 TON per contest, distributed to top 10.
+const CONTEST_PRIZES = [45,28,20,15,12,10,8,6,4,2]; // sum = 150 TON
+async function hGetContests(env,uid,_data,_meta={}){
+  try{
+    const all=await dbGet(env,'users');
+    const users=all.data||{};
+    const refList=[];
+    const bikeList=[];
+    for(const [id,u] of Object.entries(users)){
+      if(!u||typeof u!=='object')continue;
+      // Referrals contest: count referrals where hasDeposited === true
+      let refCount=0;
+      const refs=u.referrals||{};
+      for(const r of Object.values(refs)){
+        if(r&&r.hasDeposited===true)refCount++;
+      }
+      // Bikes contest: count of paid bikes owned (exclude free starter bike id=0)
+      const bikeCount=Array.isArray(u.ownedBikes)
+        ? u.ownedBikes.filter(b=>Number(b)!==0).length
+        : 0;
+      const name=`${u.firstName||''} ${u.lastName||''}`.trim()||u.username||'Racer';
+      const photo=u.photoUrl||null;
+      if(refCount>0)refList.push({userId:id,name,photo,count:refCount});
+      if(bikeCount>0)bikeList.push({userId:id,name,photo,count:bikeCount});
+    }
+    refList.sort((a,b)=>b.count-a.count||a.userId.localeCompare(b.userId));
+    bikeList.sort((a,b)=>b.count-a.count||a.userId.localeCompare(b.userId));
+    const top=(arr)=>arr.slice(0,10).map((u,i)=>({
+      ...u,rank:i+1,prize:CONTEST_PRIZES[i]||0
+    }));
+    const myRank=(arr)=>{
+      const i=arr.findIndex(x=>x.userId===uid);
+      return i<0?null:{rank:i+1,count:arr[i].count,prize:CONTEST_PRIZES[i]||0};
+    };
+    return{success:true,data:{
+      referrals:{
+        title:'Top Referrers',
+        totalPrize:150,
+        top10:top(refList),
+        me:myRank(refList),
+        totalPlayers:refList.length,
+      },
+      bikes:{
+        title:'Top Bike Owners',
+        totalPrize:150,
+        top10:top(bikeList),
+        me:myRank(bikeList),
+        totalPlayers:bikeList.length,
+      },
+      prizes:CONTEST_PRIZES,
+    }};
+  }catch(e){console.error('getContests:',e);return{success:false,error:e.message};}
 }
 
 // ── Check Membership ──────────────────────────────────────────────
 async function checkMembership(env,uid,link){
   try{
-    if(!process.env.BOT_TOKEN)return true;
+    const botToken=getBotToken();
+    if(!botToken){console.error('checkMembership: BOT_TOKEN is not configured');return false;}
     let username=link.split('t.me/')[1]?.split('?')[0]?.split('/')[0];
     if(!username)return false;
     if(!username.startsWith('@'))username='@'+username;
-    const res=await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(username)}&user_id=${uid}`);
+    const res=await fetch(`https://api.telegram.org/bot${botToken}/getChatMember?chat_id=${encodeURIComponent(username)}&user_id=${uid}`);
     if(!res.ok)return false;
     const j=await res.json();
     if(!j.ok)return false;
@@ -1275,51 +1348,6 @@ async function hAdmin(env,action,data,ctx=null){
   }
 }
 
-// ── Get Leaderboard ───────────────────────────────────────────────
-// Competition 1: Most referrals who deposited (احالات + إيداع)
-// Competition 2: Most bikes owned (عدد الدراجات)
-// Prize distribution (150 TON each): 1st=45,2nd=30,3rd=20,4th=15,5th=12,6th=10,7th=8,8th=5,9th=3,10th=2
-const COMP_PRIZES=[45,30,20,15,12,10,8,5,3,2];
-async function hGetLeaderboard(env,uid,_data,_meta={}){
-  try{
-    const allUsersR=await dbGet(env,'users');
-    const allUsers=allUsersR.data||{};
-    const refBoard=[];
-    const bikeBoard=[];
-    for(const[userId,user] of Object.entries(allUsers)){
-      if(!user||typeof user!=='object')continue;
-      const name=(`${user.firstName||''} ${user.lastName||''}`).trim()||'Player';
-      const username=user.username||'';
-      const photoUrl=user.photoUrl||'';
-      // Referral competition: count referrals who deposited
-      let depositedRefs=0;
-      if(user.referrals&&typeof user.referrals==='object'){
-        depositedRefs=Object.values(user.referrals).filter(r=>r&&r.hasDeposited===true).length;
-      }
-      // Bike competition: count all owned bikes
-      const bikeCount=(user.ownedBikes||[]).length;
-      if(depositedRefs>0)refBoard.push({userId,name,username,photoUrl,score:depositedRefs});
-      if(bikeCount>0)bikeBoard.push({userId,name,username,photoUrl,score:bikeCount});
-    }
-    refBoard.sort((a,b)=>b.score-a.score);
-    bikeBoard.sort((a,b)=>b.score-a.score);
-    const top10Refs=refBoard.slice(0,10).map((e,i)=>({...e,rank:i+1,prize:COMP_PRIZES[i]||0}));
-    const top10Bikes=bikeBoard.slice(0,10).map((e,i)=>({...e,rank:i+1,prize:COMP_PRIZES[i]||0}));
-    const myRefIdx=refBoard.findIndex(e=>e.userId===uid);
-    const myBikeIdx=bikeBoard.findIndex(e=>e.userId===uid);
-    return{success:true,data:{
-      refLeaderboard:top10Refs,
-      bikeLeaderboard:top10Bikes,
-      myRefRank:myRefIdx>=0?myRefIdx+1:null,
-      myBikeRank:myBikeIdx>=0?myBikeIdx+1:null,
-      myRefScore:myRefIdx>=0?refBoard[myRefIdx].score:0,
-      myBikeScore:myBikeIdx>=0?bikeBoard[myBikeIdx].score:0,
-      prizes:COMP_PRIZES,
-      totalPrize:150,
-    }};
-  }catch(e){console.error('getLeaderboard:',e);return{success:false,error:e.message};}
-}
-
 // ── Save Season Allocation ────────────────────────────────────────
 async function hSaveSeasonAlloc(env,uid,data,_meta={}){
   try{
@@ -1359,7 +1387,7 @@ app.post('/api', async (req, res) => {
 
   const ADMIN_ACTIONS = new Set(['adminGetUser','adminSetBalance','adminConfirmDeposit','adminApproveWithdraw','adminRejectWithdraw','adminGetQueue','adminApprovePartnerPost','adminRejectPartnerPost']);
   if (ADMIN_ACTIONS.has(action)) {
-    const v = await validateTg(authHeader.replace('Telegram ', ''), process.env.BOT_TOKEN);
+    const v = await validateTg(authHeader.replace('Telegram ', ''), getBotToken());
     if (!v.valid) return res.status(401).json({ success: false, error: 'Unauthorized' });
     const adminIds = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim());
     if (!adminIds.includes(String(v.user?.id))) return res.status(403).json({ success: false, error: 'Forbidden' });
@@ -1369,10 +1397,10 @@ app.post('/api', async (req, res) => {
   if (action === 'ping') return res.json({ success: true, data: { pong: true, ts: Date.now() } });
   if (!authHeader.startsWith('Telegram ')) return res.status(401).json({ success: false, error: 'Telegram authentication required' });
 
-  const v = await validateTg(authHeader.replace('Telegram ', ''), process.env.BOT_TOKEN);
+  const v = await validateTg(authHeader.replace('Telegram ', ''), getBotToken());
   if (!v.valid) {
     console.error('TG validation failed:', v.error);
-    return res.status(401).json({ success: false, error: 'Invalid Telegram authentication', errorCode: 'INVALID_TELEGRAM_AUTH', debug: { hasInitData: !!authHeader, botTokenConfigured: !!process.env.BOT_TOKEN, environment: process.env.ENVIRONMENT || 'production', validationError: v.error } });
+    return res.status(401).json({ success: false, error: 'Invalid Telegram authentication', errorCode: 'INVALID_TELEGRAM_AUTH', debug: { hasInitData: !!authHeader, botTokenConfigured: !!getBotToken(), environment: process.env.ENVIRONMENT || 'production', validationError: v.error } });
   }
 
   const uid = String(v.user.id);
@@ -1403,7 +1431,7 @@ app.post('/api', async (req, res) => {
     case 'claimMissionTask':  result = await hClaimMissionTask(env,uid,data,_meta,ctx); break;
     case 'submitPartnerPost': result = await hSubmitPartnerPost(env,uid,data,_meta); break;
     case 'saveSeasonAlloc':   result = await hSaveSeasonAlloc(env,uid,data,_meta); break;
-    case 'getLeaderboard':    result = await hGetLeaderboard(env,uid,data,_meta); break;
+    case 'getContests':       result = await hGetContests(env,uid,data,_meta); break;
     default: return res.status(400).json({ success: false, error: 'Unknown action' });
   }
   res.json(result);
