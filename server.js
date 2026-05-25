@@ -358,7 +358,7 @@ function makeUser(uid,tg={},ref=null){
     lastName:(tg.last_name||'').slice(0,64),
     username:(tg.username||'').slice(0,64),
     photoUrl:(tg.photo_url||'').slice(0,512),
-    tonBalance:0.01, // Free signup bonus
+    tonBalance:0.005, // Free signup bonus
     signupBonusGiven:true,
     hasDeposited:false,
     hasWithdrawn:false,
