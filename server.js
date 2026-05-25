@@ -973,11 +973,15 @@ async function hGetContests(env,uid,_data,_meta={}){
     const bikeList=[];
     for(const [id,u] of Object.entries(users)){
       if(!u||typeof u!=='object')continue;
-      // Referrals contest: count ONLY referrals where hasDeposited === true
+      // Referrals contest: count ONLY referrals whose USER PROFILE has hasDeposited === true
       let refCount=0;
       const refs=u.referrals||{};
       for(const r of Object.values(refs)){
-        if(r&&r.hasDeposited===true)refCount++;
+        if(!r)continue;
+        // Look up the referred user's actual profile to check hasDeposited
+        const refUserId=r.userId||r.id||null;
+        const refUser=refUserId?users[refUserId]:null;
+        if(refUser&&refUser.hasDeposited===true)refCount++;
       }
       // Bikes contest: count of paid bikes owned (exclude free starter bike id=0)
       const bikeCount=Array.isArray(u.ownedBikes)
