@@ -710,10 +710,28 @@ async function hWithdraw(env,uid,data,_meta={}){
       const hasPendingWd=Object.values(wdHistMap).some(w=>w&&w.status==='pending');
       if(hasPendingWd){await dbSet(env,lockKey,{ts:0});return{success:false,error:'You already have a pending withdrawal. Please wait for it to be processed before creating a new one.',errorCode:'PENDING_WITHDRAW_EXISTS'};}
       
-      // Partner-tasks requirement removed — forced channel subscription handles this at startup.
+      // ── Free-user withdrawal cap: max 0.1 TON total ─────────────
+      // A user is "free" if they haven't deposited AND have no referral who deposited.
+      if(!user.hasDeposited){
+        const refs=user.referrals||{};
+        const hasActiveRef=Object.values(refs).some(r=>r&&r.hasDeposited===true);
+        if(!hasActiveRef){
+          const FREE_WD_MAX=0.1;
+          // Sum all non-rejected withdrawals (pending + approved)
+          const totalWdSoFar=Object.values(wdHistMap).reduce((s,w)=>{
+            if(w&&(w.status==='pending'||w.status==='approved'))return s+parseFloat(w.amtRequested||w.amt||0);
+            return s;
+          },0);
+          if(parseFloat((totalWdSoFar+amt).toFixed(8))>FREE_WD_MAX){
+            const remaining=parseFloat((FREE_WD_MAX-totalWdSoFar).toFixed(8));
+            await dbSet(env,lockKey,{ts:0});
+            return{success:false,
+              error:`Free accounts are limited to ${FREE_WD_MAX} TON total withdrawals. You have ${Math.max(0,remaining).toFixed(4)} TON remaining. To unlock unlimited withdrawals, make a deposit or invite a friend who deposits.`,
+              errorCode:'FREE_USER_LIMIT'};
+          }
+        }
+      }
 
-
-      
       const wdId=`wd_${uid}_${now}`;
       // Apply 10% withdrawal fee only for amounts above 0.01 TON
       const FREE_FEE_THRESHOLD=0.01;
