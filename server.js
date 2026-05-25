@@ -1285,8 +1285,9 @@ async function hRacePoll(env,uid,_data,_meta={}){
           matchId,createdAt:Date.now(),
           winnerUid,prize:RACE_PRIZE,cost:RACE_COST,
           isBot:true,botUid,
-          p1:{uid:uid,lv:q.data.lv,name:q.data.name,username:q.data.username||'',photoUrl:q.data.photoUrl||'',maxKmh:q.data.maxKmh,power:q.data.power},
-          p2:{uid:botUid,lv:botLv,name:botName,username:'',photoUrl:botPhoto,maxKmh:botMaxKmh,power:botPowerTotal,isBot:true},
+          // Bot is p1 (displayed as opponent/left), user is p2 (displayed as you/right)
+          p1:{uid:botUid,lv:botLv,name:botName,username:'',photoUrl:botPhoto,maxKmh:botMaxKmh,power:botPowerTotal,isBot:true},
+          p2:{uid:uid,lv:q.data.lv,name:q.data.name,username:q.data.username||'',photoUrl:q.data.photoUrl||'',maxKmh:q.data.maxKmh,power:q.data.power},
           ack:{}
         };
         await dbSet(env,`raceMatches/${matchId}`,match);
@@ -1307,7 +1308,7 @@ async function hRacePoll(env,uid,_data,_meta={}){
         return{success:true,data:{
           status:'matched',matchId,
           youWon:winnerUid===uid,
-          youAreP1:true,prize:RACE_PRIZE,
+          youAreP1:false,prize:RACE_PRIZE,   // user is p2; bot is p1
           you:{uid:uid,lv:q.data.lv,name:q.data.name,username:q.data.username,photoUrl:q.data.photoUrl,maxKmh:q.data.maxKmh},
           opp:{uid:botUid,lv:botLv,name:botName,username:'',photoUrl:botPhoto,maxKmh:botMaxKmh,isBot:true},
           tonBalance:curBal
