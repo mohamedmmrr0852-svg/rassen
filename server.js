@@ -288,7 +288,7 @@ const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,verifyForce
 function userActionOk(uid,action){const cd=ACTION_COOLDOWNS[action];if(!cd)return true;const key=`${uid}:${action}`;const now=Date.now();const last=_userActionTs.get(key)||0;if(now-last<cd)return false;_userActionTs.set(key,now);return true;}
 
 // Logging
-const BALANCE_CHANGE_EVENTS=new Set(['withdraw_request','deposit_completed','claim_task','verify_task','create_task','admin_set_balance','admin_confirm_deposit','referral_commission','buy_bike','upgrade_stats','bike_mining_start','bike_mining_claim','claim_mission_task','partner_post_reward','race_result']);
+const BALANCE_CHANGE_EVENTS=new Set(['withdraw_request','deposit_completed','claim_task','verify_task','create_task','admin_set_balance','admin_confirm_deposit','referral_commission','buy_bike','upgrade_stats','bike_mining_start','bike_mining_claim','claim_mission_task','partner_post_reward','race_result','contest_prize']);
 function log(env,uid,type,details={},meta={}){
   if(!BALANCE_CHANGE_EVENTS.has(type))return;
   const ts=Date.now();const date=new Date(ts).toISOString();
@@ -892,21 +892,64 @@ async function hVerifyForcedSubscription(env,uid,_data,_meta={}){
 }
 
 // ── Contests: Top Referrers (deposited) & Top Bike Owners ─────────
-// Prize pool: 150 TON per contest, distributed to top 10.
+// Prize pool: 150 TON per contest, distributed to top 10 each week.
 const CONTEST_PRIZES = [45,28,20,15,12,10,8,6,4,2]; // sum = 150 TON
+const CONTEST_WEEK_MS = 7*24*60*60*1000;
+
+async function getOrCreateContestPeriod(env){
+  const pr=await dbGet(env,'contestPeriod');
+  const now=Date.now();
+  if(pr.data&&pr.data.endsAt&&pr.data.endsAt>now){
+    return{period:pr.data,justEnded:false,oldPeriod:null};
+  }
+  const justEnded=!!(pr.data&&pr.data.endsAt&&pr.data.endsAt<=now&&!pr.data.distributed);
+  const oldPeriod=justEnded?pr.data:null;
+  const newPeriod={startedAt:now,endsAt:now+CONTEST_WEEK_MS,distributed:false};
+  await dbSet(env,'contestPeriod',newPeriod);
+  return{period:newPeriod,justEnded,oldPeriod};
+}
+
+async function distributeContestPrizes(env,refList,bikeList){
+  try{
+    await dbUpdate(env,'contestPeriod',{distributed:true,distributedAt:Date.now()});
+    for(let i=0;i<Math.min(10,refList.length);i++){
+      const prize=CONTEST_PRIZES[i]||0;
+      if(prize<=0)continue;
+      const u=await dbGet(env,`users/${refList[i].userId}`);
+      if(u.data){
+        const nb=parseFloat(((u.data.tonBalance||0)+prize).toFixed(4));
+        await dbUpdate(env,`users/${refList[i].userId}`,{tonBalance:nb});
+        log(env,refList[i].userId,'contest_prize',{contestType:'referrals',rank:i+1,prize_ton:prize,tonBalance_before:u.data.tonBalance||0,tonBalance_after:nb},{});
+      }
+    }
+    for(let i=0;i<Math.min(10,bikeList.length);i++){
+      const prize=CONTEST_PRIZES[i]||0;
+      if(prize<=0)continue;
+      const u=await dbGet(env,`users/${bikeList[i].userId}`);
+      if(u.data){
+        const nb=parseFloat(((u.data.tonBalance||0)+prize).toFixed(4));
+        await dbUpdate(env,`users/${bikeList[i].userId}`,{tonBalance:nb});
+        log(env,bikeList[i].userId,'contest_prize',{contestType:'bikes',rank:i+1,prize_ton:prize,tonBalance_before:u.data.tonBalance||0,tonBalance_after:nb},{});
+      }
+    }
+  }catch(e){console.error('distributeContestPrizes:',e.message);}
+}
+
 async function hGetContests(env,uid,_data,_meta={}){
   try{
+    // Get or create contest period (weekly)
+    const {period,justEnded,oldPeriod}=await getOrCreateContestPeriod(env);
     const all=await dbGet(env,'users');
     const users=all.data||{};
     const refList=[];
     const bikeList=[];
     for(const [id,u] of Object.entries(users)){
       if(!u||typeof u!=='object')continue;
-      // Referrals contest: count referrals where hasDeposited === true
+      // Referrals contest: count active referrals (hasJoinedChannels OR deposited)
       let refCount=0;
       const refs=u.referrals||{};
       for(const r of Object.values(refs)){
-        if(r&&r.hasDeposited===true)refCount++;
+        if(r&&(r.hasDeposited===true||r.hasJoinedChannels===true))refCount++;
       }
       // Bikes contest: count of paid bikes owned (exclude free starter bike id=0)
       const bikeCount=Array.isArray(u.ownedBikes)
@@ -919,6 +962,10 @@ async function hGetContests(env,uid,_data,_meta={}){
     }
     refList.sort((a,b)=>b.count-a.count||a.userId.localeCompare(b.userId));
     bikeList.sort((a,b)=>b.count-a.count||a.userId.localeCompare(b.userId));
+    // If previous period just ended, distribute prizes in background
+    if(justEnded&&oldPeriod&&!oldPeriod.distributed){
+      distributeContestPrizes(env,refList,bikeList).catch(e=>console.error('prize dist:',e.message));
+    }
     const top=(arr)=>arr.slice(0,10).map((u,i)=>({
       ...u,rank:i+1,prize:CONTEST_PRIZES[i]||0
     }));
@@ -942,6 +989,7 @@ async function hGetContests(env,uid,_data,_meta={}){
         totalPlayers:bikeList.length,
       },
       prizes:CONTEST_PRIZES,
+      period:{startedAt:period.startedAt,endsAt:period.endsAt},
     }};
   }catch(e){console.error('getContests:',e);return{success:false,error:e.message};}
 }
@@ -1214,17 +1262,23 @@ async function hRacePoll(env,uid,_data,_meta={}){
         const botName=BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)];
         const botPhoto=BOT_PHOTOS[Math.floor(Math.random()*BOT_PHOTOS.length)];
         const botUid=`bot_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
-        const botLv=q.data.lv;
+        // Bot level: user level ±0-2 (min 1, max 10), biased slightly higher
+        const userLv=q.data.lv;
+        const lvDelta=Math.floor(Math.random()*3); // 0,1,2
+        const lvDir=Math.random()<0.65?1:-1; // 65% chance bot is higher level
+        const botLv=Math.max(1,Math.min(10,userLv+(lvDelta*lvDir)));
         const botBase=BIKE_BASE_STATS[botLv]||BIKE_BASE_STATS[1];
-        const botPowerTotal=botBase.speed+botBase.nitro+botBase.accel+botBase.maneuver;
+        // Bot gets a 35% power boost — it's an AI, it's faster
+        const BOT_PWR_BOOST=1.35;
+        const botPowerTotal=Math.round((botBase.speed+botBase.nitro+botBase.accel+botBase.maneuver)*BOT_PWR_BOOST);
         const botMaxKmh=Math.min(500,Math.max(35,Math.round(botPowerTotal/2)));
         const myPower=q.data.power||0;
-        // Winner decided by relative power + randomness
+        // Bot wins ~70% overall — it has a built-in speed advantage
         const rnd=Math.random();
         let winnerUid;
-        if(myPower>botPowerTotal*1.15){winnerUid=rnd<0.72?uid:botUid;}
-        else if(botPowerTotal>myPower*1.15){winnerUid=rnd<0.72?botUid:uid;}
-        else{winnerUid=rnd<0.5?uid:botUid;}
+        if(myPower>botPowerTotal*1.4){winnerUid=rnd<0.60?uid:botUid;}       // User much stronger: user 60%
+        else if(myPower>botPowerTotal*1.1){winnerUid=rnd<0.42?uid:botUid;}  // User slightly stronger: bot 58%
+        else{winnerUid=rnd<0.72?botUid:uid;}                                 // Bot same/stronger: bot 72%
         await dbDelete(env,`raceQueue/${uid}`);
         const matchId=`m_${Date.now()}_bot_${Math.random().toString(36).slice(2,9)}`;
         const match={
