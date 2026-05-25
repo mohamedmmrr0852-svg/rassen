@@ -79,9 +79,9 @@ const BIKE_BASE_STATS = {
 };
 
 const BIKE_DAILY_TON = {
-  0:0.0001,
-  1:0.022, 2:0.111, 3:0.222, 4:0.444, 5:1.11,
-  6:2.22, 7:4.44, 8:5.55, 9:8.88, 10:11.11,
+  0:0.0002,
+  1:0.044, 2:0.222, 3:0.444, 4:0.888, 5:2.22,
+  6:4.44, 7:8.88, 8:11.1, 9:17.76, 10:22.22,
 };
 const BIKE_MINING_MS = 24*60*60*1000;
 
@@ -284,7 +284,7 @@ function rateOk(ip){const now=Date.now();const d=_rl.get(ip)||{c:0,r:now+60000};
 
 // Per-user per-action cooldown
 const _userActionTs=new Map();
-const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,verifyForcedSubscription:3000,createTask:5000,buyBike:2500,upgradeStats:2500,deposit:2500,startBikeMining:2500,claimBikeMining:2500,raceResult:4000,raceJoinQueue:1500,racePoll:400,raceCancelQueue:1500,raceAck:800,claimMissionTask:2500,submitPartnerPost:5000,saveSeasonAlloc:10000,saveLanguage:2000};
+const ACTION_COOLDOWNS={withdraw:5000,claimTask:2500,verifyTask:2500,verifyForcedSubscription:3000,createTask:5000,buyBike:2500,upgradeStats:2500,deposit:2500,startBikeMining:2500,claimBikeMining:2500,raceResult:4000,raceJoinQueue:1500,racePoll:400,raceCancelQueue:1500,raceAck:800,claimMissionTask:2500,submitPartnerPost:5000,saveSeasonAlloc:10000,saveLanguage:2000,submitPartnerChannel:8000};
 function userActionOk(uid,action){const cd=ACTION_COOLDOWNS[action];if(!cd)return true;const key=`${uid}:${action}`;const now=Date.now();const last=_userActionTs.get(key)||0;if(now-last<cd)return false;_userActionTs.set(key,now);return true;}
 
 // Logging
@@ -473,15 +473,24 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
       // admin
       by:e.by,
     })):[];
-    // Fetch partner (forced channels) + community tasks + contests (preloaded with state)
-    const [tPartnerR,tCommunityR,contestsR]=await Promise.all([
+    // Fetch partner (forced channels) + community tasks + user-submitted partner channels + contests
+    const [tPartnerR,tCommunityR,partnerChR,contestsR]=await Promise.all([
       dbGet(env,'tasks/partner'),
       dbGet(env,'tasks/community'),
+      dbGet(env,'partnerChannelQueue'),
       hGetContests(env,uid,{},_meta).catch(e=>({success:false,error:String(e&&e.message||e)})),
     ]);
     let partnerTasksList=tPartnerR.data?Object.values(tPartnerR.data).filter(t=>t.status==='active'):[];
     if(!partnerTasksList.length) partnerTasksList=DEFAULT_PARTNER_TASKS.filter(t=>t.status==='active');
     const communityTasksList=tCommunityR.data?Object.values(tCommunityR.data).filter(t=>t.status==='active'):[];
+    // User-submitted partner channels (admin-approved only)
+    const partnerChannelsList=partnerChR.data
+      ?Object.values(partnerChR.data).filter(t=>t&&t.status==='active').map(t=>({
+          id:t.id,type:'channel',channelLink:t.channelLink,
+          name:'Join Channel',tonReward:t.tonReward||0.001,
+          status:'active',userId:t.userId,ts:t.ts||0,
+        }))
+      :[];
     const contestsData=(contestsR&&contestsR.success&&contestsR.data)?contestsR.data:null;
     return{success:true,data:{
       user:{
@@ -511,8 +520,8 @@ async function hGetState(env,uid,tg,data={},_meta={},ctx=null){
       balanceLog,
       // Forced subscription channels (shown in modal, NOT in tasks page)
       forcedChannels:partnerTasksList,
-      // Tasks page: only community tasks, partner removed
-      tasks:{partner:[],community:communityTasksList},
+      // Tasks page: community tasks + user-submitted partner channels
+      tasks:{partner:[],community:communityTasksList,partnerChannels:partnerChannelsList},
       // Contests data preloaded so leaderboard renders instantly
       contests:contestsData,
     }};
@@ -835,6 +844,25 @@ async function hClaimMissionTask(env,uid,data,_meta={},ctx=null){
       await dbSet(env,lockKey,{ts:0});
       return{success:true,data:{tonBalance:parseFloat(newTon.toFixed(8)),tonAdded:tonReward}};
     }catch(innerErr){await dbSet(env,lockKey,{ts:0}).catch(()=>{});throw innerErr;}
+  }catch(e){return{success:false,error:e.message};}
+}
+
+// ── Submit Partner Channel (user submits their channel for partner tab) ──
+async function hSubmitPartnerChannel(env,uid,data,_meta={}){
+  try{
+    const channelLink=(data.channelLink||'').trim();
+    const postLink=(data.postLink||'').trim();
+    if(!channelLink||channelLink.length<10)return{success:false,error:'رابط القناة غير صالح / Invalid channel link'};
+    if(!postLink||postLink.length<10)return{success:false,error:'رابط المنشور غير صالح / Invalid post link'};
+    // Check for existing pending submission from this user
+    const existing=await dbGet(env,'partnerChannelQueue');
+    const queue=existing.data||{};
+    const alreadyPending=Object.values(queue).find(v=>v&&v.userId===uid&&v.status==='pending');
+    if(alreadyPending)return{success:false,error:'لديك طلب قيد المراجعة بالفعل / You already have a pending submission'};
+    const id=`pc_${uid}_${Date.now()}`;
+    const rec={id,userId:uid,channelLink,postLink,status:'pending',tonReward:0.001,ts:Date.now()};
+    await dbSet(env,`partnerChannelQueue/${id}`,rec);
+    return{success:true,data:{id,status:'pending'}};
   }catch(e){return{success:false,error:e.message};}
 }
 
@@ -1444,6 +1472,21 @@ async function hAdmin(env,action,data,ctx=null){
       return{success:true};
     }
     case 'adminGetQueue':{const q=await dbGet(env,'withdrawQueue');return{success:true,data:q.data||{}};}
+    case 'adminGetPartnerChannelQueue':{const q=await dbGet(env,'partnerChannelQueue');return{success:true,data:q.data||{}};}
+    case 'adminApprovePartnerChannel':{
+      const r=await dbGet(env,`partnerChannelQueue/${data.id}`);if(!r.data)return{success:false,error:'Not found'};
+      await dbUpdate(env,`partnerChannelQueue/${data.id}`,{status:'active',approvedAt:Date.now()});
+      return{success:true};
+    }
+    case 'adminRejectPartnerChannel':{
+      const r=await dbGet(env,`partnerChannelQueue/${data.id}`);if(!r.data)return{success:false,error:'Not found'};
+      await dbUpdate(env,`partnerChannelQueue/${data.id}`,{status:'rejected',rejectedAt:Date.now()});
+      return{success:true};
+    }
+    case 'adminDeletePartnerChannel':{
+      await dbDelete(env,`partnerChannelQueue/${data.id}`);
+      return{success:true};
+    }
     case 'adminApprovePartnerPost':{
       const r=await dbGet(env,`partnerPostQueue/${data.postId}`);if(!r.data)return{success:false,error:'Not found'};
       const reward=parseFloat(data.reward)||0;
@@ -1505,7 +1548,7 @@ app.post('/api', async (req, res) => {
   const data = body.data || {};
   if (!action) return res.status(400).json({ success: false, error: 'Missing action' });
 
-  const ADMIN_ACTIONS = new Set(['adminGetUser','adminSetBalance','adminConfirmDeposit','adminApproveWithdraw','adminRejectWithdraw','adminGetQueue','adminApprovePartnerPost','adminRejectPartnerPost']);
+  const ADMIN_ACTIONS = new Set(['adminGetUser','adminSetBalance','adminConfirmDeposit','adminApproveWithdraw','adminRejectWithdraw','adminGetQueue','adminApprovePartnerPost','adminRejectPartnerPost','adminGetPartnerChannelQueue','adminApprovePartnerChannel','adminRejectPartnerChannel','adminDeletePartnerChannel']);
   if (ADMIN_ACTIONS.has(action)) {
     const v = await validateTg(authHeader.replace('Telegram ', ''), getBotToken());
     if (!v.valid) return res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -1549,8 +1592,9 @@ app.post('/api', async (req, res) => {
     case 'raceCancelQueue':   result = await hRaceCancelQueue(env,uid,data,_meta); break;
     case 'raceAck':           result = await hRaceAck(env,uid,data,_meta,ctx); break;
     case 'claimMissionTask':  result = await hClaimMissionTask(env,uid,data,_meta,ctx); break;
-    case 'submitPartnerPost': result = await hSubmitPartnerPost(env,uid,data,_meta); break;
-    case 'saveSeasonAlloc':   result = await hSaveSeasonAlloc(env,uid,data,_meta); break;
+    case 'submitPartnerPost':    result = await hSubmitPartnerPost(env,uid,data,_meta); break;
+    case 'submitPartnerChannel': result = await hSubmitPartnerChannel(env,uid,data,_meta); break;
+    case 'saveSeasonAlloc':      result = await hSaveSeasonAlloc(env,uid,data,_meta); break;
     case 'getContests':       result = await hGetContests(env,uid,data,_meta); break;
     default: return res.status(400).json({ success: false, error: 'Unknown action' });
   }
