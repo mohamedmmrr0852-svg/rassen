@@ -712,9 +712,27 @@ async function hWithdraw(env,uid,data,_meta={}){
       
       // ── Free-user withdrawal cap: max 0.1 TON total ─────────────
       // A user is "free" if they haven't deposited AND have no referral who deposited.
+      // NOTE: referrals are stored at users/${uid}/referrals in DB, NOT inside user object.
       if(!user.hasDeposited){
-        const refs=user.referrals||{};
-        const hasActiveRef=Object.values(refs).some(r=>r&&r.hasDeposited===true);
+        const refsRec=await dbGet(env,`users/${uid}/referrals`);
+        const refsMap=refsRec.data||{};
+
+        // Check each referral: cached flag first, then live profile as fallback
+        let hasActiveRef=false;
+        for(const r of Object.values(refsMap)){
+          if(!r||!r.userId)continue;
+          // Fast path: cached flag already true
+          if(r.hasDeposited===true){hasActiveRef=true;break;}
+          // Slow path: check the referred user's actual profile
+          const refUserRec=await dbGet(env,`users/${r.userId}/hasDeposited`);
+          if(refUserRec.data===true){
+            hasActiveRef=true;
+            // Back-fill cache so future calls skip the slow path
+            await dbUpdate(env,`users/${uid}/referrals/${r.userId}`,{hasDeposited:true}).catch(()=>{});
+            break;
+          }
+        }
+
         if(!hasActiveRef){
           const FREE_WD_MAX=0.1;
           // Sum all non-rejected withdrawals (pending + approved)
@@ -723,10 +741,10 @@ async function hWithdraw(env,uid,data,_meta={}){
             return s;
           },0);
           if(parseFloat((totalWdSoFar+amt).toFixed(8))>FREE_WD_MAX){
-            const remaining=parseFloat((FREE_WD_MAX-totalWdSoFar).toFixed(8));
+            const remaining=Math.max(0,parseFloat((FREE_WD_MAX-totalWdSoFar).toFixed(8)));
             await dbSet(env,lockKey,{ts:0});
             return{success:false,
-              error:`Free accounts are limited to ${FREE_WD_MAX} TON total withdrawals. You have ${Math.max(0,remaining).toFixed(4)} TON remaining. To unlock unlimited withdrawals, make a deposit or invite a friend who deposits.`,
+              error:`Free accounts are limited to ${FREE_WD_MAX} TON total withdrawals. You have ${remaining.toFixed(4)} TON remaining. To unlock unlimited withdrawals, make a deposit or invite a friend who deposits.`,
               errorCode:'FREE_USER_LIMIT'};
           }
         }
